@@ -94,7 +94,7 @@ class ReolinkDownloadResponse(web.StreamResponse):
 class ReolinkDownloadView(HomeAssistantView):
     """Download VOD View."""
 
-    url = "/api/reolink_download/{config_entry_id}/{channel_str}/{stream_res}/{filename:.*}"
+    url = "/api/reolink_download/{config_entry_id}/{channel_str}/{stream_res}/{filename}/{start}/{end}"
     name = "api:reolink:download"
 
     # requires_auth = False
@@ -111,6 +111,8 @@ class ReolinkDownloadView(HomeAssistantView):
         channel_str: str,
         stream_res: str,
         filename: str,
+        start: str,
+        end: str,
     ) -> web.StreamResponse:
         """Start a GET request."""
 
@@ -122,7 +124,7 @@ class ReolinkDownloadView(HomeAssistantView):
         if entry.host.api.api_version("recDownload", channel) < 1:
             raise web.HTTPServiceUnavailable()
 
-        source = await entry.host.api.download_vod(filename)
+        source = await entry.host.api.download_vod(filename,start_time = start, end_time = end, channel = channel, stream=stream_res)
 
         return ReolinkDownloadResponse(source)
 
@@ -140,21 +142,23 @@ class ReolinkVODMediaSource(MediaSource):
 
     async def async_resolve_media(self, item: MediaSourceItem) -> PlayMedia:
         """Resolve media to a url."""
-        identifier = item.identifier.split("|", 5)
+        identifier = item.identifier.split("|", 7)
         if identifier[0] != "FILE":
             raise Unresolvable(f"Unknown media item '{item.identifier}'.")
 
-        _, config_entry_id, channel_str, stream_res, filename = identifier
+        _, config_entry_id, channel_str, stream_res, filename, start, end = identifier
         channel = int(channel_str)
 
         host = self.data[config_entry_id].host
-        if host.api.api_version("recDownload", channel) == 1:
+        if not host.api.is_nvr and host.api.api_version("recDownload", channel) > 0:
             return PlayMedia(
-                ReolinkDownloadView.url.replace(":.*}", "}").format(
+                ReolinkDownloadView.url.format(
                     config_entry_id=config_entry_id,
                     channel_str=channel_str,
                     stream_res=stream_res,
                     filename=filename,
+                    start=start,
+                    end=end,
                 ),
                 "video/mp4",
             )
@@ -283,11 +287,10 @@ class ReolinkVODMediaSource(MediaSource):
         """Allow the user to select the high or low playback resolution, (low loads faster)."""
         host = self.data[config_entry_id].host
 
-        hasExt = host.api.api_version("live", channel) == 1
-
         children: list[BrowseMediaSource] = []
         main_enc = await host.api.get_encoding(channel, "main")
-        noMain = main_enc == "h265" and host.api.api_version("recDownload", channel) < 1
+        noMain = main_enc == "h265" and (host.api.api_version("recDownload", channel) < 1 or host.api.is_nvr)
+        hasExt = not host.api.is_nvr and host.api.api_version("live", channel) > 0
         if noMain:
             _LOGGER.debug(
                 "Reolink camera %s uses h265 encoding for main stream,"
@@ -306,7 +309,7 @@ class ReolinkVODMediaSource(MediaSource):
                     identifier=f"RES|{config_entry_id}|{channel}|ext",
                     media_class=MediaClass.CHANNEL,
                     media_content_type=MediaType.PLAYLIST,
-                    title="Low resolution",
+                    title="Middle resolution",
                     can_play=False,
                     can_expand=True,
                 )
@@ -318,7 +321,7 @@ class ReolinkVODMediaSource(MediaSource):
                 identifier=f"RES|{config_entry_id}|{channel}|sub",
                 media_class=MediaClass.CHANNEL,
                 media_content_type=MediaType.PLAYLIST,
-                title=f"{'Standard' if hasExt else 'Low'} resolution",
+                title=f"Low resolution",
                 can_play=False,
                 can_expand=True,
             )
@@ -431,10 +434,12 @@ class ReolinkVODMediaSource(MediaSource):
                     if trigger != trigger.NONE
                 )
 
+            file_start = file.start_time.strftime('%Y%m%d%H%M%S')
+            file_end = file.end_time.strftime('%Y%m%d%H%M%S')
             children.append(
                 BrowseMediaSource(
                     domain=DOMAIN,
-                    identifier=f"FILE|{config_entry_id}|{channel}|{stream}|{file.file_name}",
+                    identifier=f"FILE|{config_entry_id}|{channel}|{stream}|{file.file_name}|{file_start}|{file_end}",
                     media_class=MediaClass.VIDEO,
                     media_content_type=MediaType.VIDEO,
                     title=file_name,
