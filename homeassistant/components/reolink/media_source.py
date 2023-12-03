@@ -150,7 +150,9 @@ class ReolinkVODMediaSource(MediaSource):
         channel = int(channel_str)
 
         host = self.data[config_entry_id].host
-        if not host.api.is_nvr and host.api.api_version("recDownload", channel) > 0:
+        # NVR supports a download method, but it requires other api calls and consumes resources on the NVR to process
+        # for now we will not do downloads on the NVR
+        if host.api.api_version("recDownload", channel) == 1 and not host.api.is_nvr:
             return PlayMedia(
                 ReolinkDownloadView.url.format(
                     config_entry_id=config_entry_id,
@@ -289,8 +291,11 @@ class ReolinkVODMediaSource(MediaSource):
 
         children: list[BrowseMediaSource] = []
         main_enc = await host.api.get_encoding(channel, "main")
-        noMain = main_enc == "h265" and (host.api.api_version("recDownload", channel) < 1 or host.api.is_nvr)
         hasExt = not host.api.is_nvr and host.api.api_version("live", channel) > 0
+        # NVR does not support downloads the same and cannot do RTSP so we will disable main on HD channels
+        noMain = main_enc == "h265" and (
+            host.api.api_version("recDownload", channel) < 1 or host.api.is_nvr
+        )
         if noMain:
             _LOGGER.debug(
                 "Reolink camera %s uses h265 encoding for main stream,"
