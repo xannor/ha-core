@@ -199,8 +199,8 @@ class ReolinkVODMediaSource(MediaSource):
         children: list[BrowseMediaSource] = []
         main_enc = await host.api.get_encoding(channel, "main")
         raw_playback = (
-            host.api.api_version("recDownload") == 1
-            or host.api.api_version("recDownload") == 1
+            host.api.api_version("recDownload", channel) == 1
+            or host.api.api_version("recDownload", channel) == 1
         )
         # NVR does not support downloads the same and cannot do RTSP so we will disable main on HD channels
         noMain = main_enc == "h265" and (not raw_playback or host.api.is_nvr)
