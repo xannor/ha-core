@@ -5,14 +5,9 @@ from __future__ import annotations
 import datetime as dt
 import logging
 
-from aiohttp import ETag, web
-from aiohttp.abc import AbstractStreamWriter
-from aiohttp.typedefs import LooseHeaders
-from aiohttp.web_request import BaseRequest
-from reolink_aio.typings import VOD_download
+from reolink_aio.typings import VOD_request_type
 
 from homeassistant.components.camera import DOMAIN as CAM_DOMAIN, DynamicStreamSettings
-from homeassistant.components.http.view import HomeAssistantView
 from homeassistant.components.media_player import MediaClass, MediaType
 from homeassistant.components.media_source.error import Unresolvable
 from homeassistant.components.media_source.models import (
@@ -34,97 +29,12 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_get_media_source(hass: HomeAssistant) -> ReolinkVODMediaSource:
     """Set up camera media source."""
-    hass.http.register_view(ReolinkDownloadView(hass))
     return ReolinkVODMediaSource(hass)
 
 
 def res_name(stream: str) -> str:
     """Return the user friendly name for a stream."""
     return "High res." if stream == "main" else "Low res."
-
-
-class ReolinkDownloadResponse(web.StreamResponse):
-    """Stream passthrough/repeater similar in vein to web.FileResponse."""
-
-    def __init__(
-        self,
-        source: VOD_download,
-        *,
-        status: int = 200,
-        reason: str | None = None,
-        headers: LooseHeaders | None = None,
-    ) -> None:
-        """Initialize response."""
-
-        super().__init__(status=status, reason=reason, headers=headers)
-        self._source = source
-
-    async def prepare(self, request: BaseRequest) -> AbstractStreamWriter | None:
-        """Prepare response."""
-        source = self._source
-
-        _LOGGER.debug("Preparing VOD for download (%s)", source.filename)
-
-        if source.etag:
-            self.etag = ETag(source.etag.replace('"', ""))
-        self.content_length = source.length
-
-        writer = await super().prepare(request)
-        assert writer is not None
-
-        transport = request.transport
-        assert transport is not None
-
-        try:
-            async for chunk in source.stream.iter_any():
-                if transport.is_closing():
-                    _LOGGER.debug("Receiver closed stream, aborting download")
-                    break
-                await writer.write(chunk)
-        except Exception:  # pylint: disable=broad-exception-caught
-            _LOGGER.exception("Caught error during read. aborting")
-
-        _LOGGER.debug("closing VOD")
-        source.close()
-
-        await writer.write_eof()
-        return writer
-
-
-class ReolinkDownloadView(HomeAssistantView):
-    """Download VOD View."""
-
-    url = "/api/reolink_download/{config_entry_id}/{channel_str}/{stream_res}/{filename:.*}"
-    name = "api:reolink:download"
-
-    # requires_auth = False
-
-    def __init__(self, hass: HomeAssistant) -> None:
-        """Initialize view."""
-        super().__init__()
-        self.data: dict[str, ReolinkData] = hass.data[DOMAIN]
-
-    async def get(
-        self,
-        request: web.Request,
-        config_entry_id: str,
-        channel_str: str,
-        stream_res: str,
-        filename: str,
-    ) -> web.StreamResponse:
-        """Start a GET request."""
-
-        entry = self.data.get(config_entry_id)
-        if entry is None:
-            raise web.HTTPNotFound()
-        channel = int(channel_str)
-
-        if entry.host.api.api_version("recDownload", channel) < 1:
-            raise web.HTTPServiceUnavailable()
-
-        source = await entry.host.api.download_vod(filename)
-
-        return ReolinkDownloadResponse(source)
 
 
 class ReolinkVODMediaSource(MediaSource):
@@ -148,31 +58,32 @@ class ReolinkVODMediaSource(MediaSource):
         channel = int(channel_str)
 
         host = self.data[config_entry_id].host
-        # NVR supports a download method, but it requires other api calls and consumes resources on the NVR to process
-        # for now we will not do downloads on the NVR
-        if host.api.api_version("recDownload", channel) == 1 and not host.api.is_nvr:
-            return PlayMedia(
-                ReolinkDownloadView.url.replace(":.*}", "}").format(
-                    config_entry_id=config_entry_id,
-                    channel_str=channel_str,
-                    stream_res=stream_res,
-                    filename=filename,
-                ),
-                "video/mp4",
-            )
+        if host.api.is_nvr:
+            req_type = VOD_request_type.FLV
+        if host.api.api_version("recPlayback", channel) == 1:
+            req_type = VOD_request_type.PLAYBACK
+        elif host.api.api_version("recDownload", channel) == 1:
+            req_type = VOD_request_type.DOWNLOAD
+        else:
+            req_type = VOD_request_type.RTMP
 
-        mime_type, url = await host.api.get_vod_source(channel, filename, stream_res)
+        mime_type, url = await host.api.get_vod_source(
+            channel, filename, stream_res, req_type
+        )
         if _LOGGER.isEnabledFor(logging.DEBUG):
             url_log = f"{url.split('&user=')[0]}&user=xxxxx&password=xxxxx"
             _LOGGER.debug(
                 "Opening VOD stream from %s: %s", host.api.camera_name(channel), url_log
             )
 
-        stream = create_stream(self.hass, url, {}, DynamicStreamSettings())
-        stream.add_provider("hls", timeout=3600)
-        stream_url: str = stream.endpoint_url("hls")
-        stream_url = stream_url.replace("master_", "")
-        return PlayMedia(stream_url, mime_type)
+        if "mpegURL" in mime_type:
+            stream = create_stream(self.hass, url, {}, DynamicStreamSettings())
+            stream.add_provider("hls", timeout=3600)
+            stream_url: str = stream.endpoint_url("hls")
+            stream_url = stream_url.replace("master_", "")
+            return PlayMedia(stream_url, mime_type)
+
+        return PlayMedia(url, mime_type)
 
     async def async_browse_media(
         self,
@@ -285,40 +196,22 @@ class ReolinkVODMediaSource(MediaSource):
         """Allow the user to select the high or low playback resolution, (low loads faster)."""
         host = self.data[config_entry_id].host
 
-        # re-evaluating supporting ext playback, NVR does not support it and it is extra work for cameras
-        # disabling for now but leaving code in place for future consideration
-        hasExt = (
-            False  # host.api.api_version("live", channel) == 1 and not host.api.is_nvr
-        )
-
         children: list[BrowseMediaSource] = []
         main_enc = await host.api.get_encoding(channel, "main")
-        # NVR does not support downloads the same and cannot do RTSP so we will disable main on HD channels
-        noMain = main_enc == "h265" and (
-            host.api.api_version("recDownload", channel) < 1 or host.api.is_nvr
+        raw_playback = (
+            host.api.api_version("recDownload") == 1
+            or host.api.api_version("recDownload") == 1
         )
+        # NVR does not support downloads the same and cannot do RTSP so we will disable main on HD channels
+        noMain = main_enc == "h265" and (not raw_playback or host.api.is_nvr)
         if noMain:
             _LOGGER.debug(
                 "Reolink camera %s uses h265 encoding for main stream,"
                 "playback only possible using sub stream",
                 host.api.camera_name(channel),
             )
-            if not hasExt:
-                return await self._async_generate_camera_days(
-                    config_entry_id, channel, "sub"
-                )
-
-        if hasExt:
-            children.append(
-                BrowseMediaSource(
-                    domain=DOMAIN,
-                    identifier=f"RES|{config_entry_id}|{channel}|ext",
-                    media_class=MediaClass.CHANNEL,
-                    media_content_type=MediaType.PLAYLIST,
-                    title="Low resolution",
-                    can_play=False,
-                    can_expand=True,
-                )
+            return await self._async_generate_camera_days(
+                config_entry_id, channel, "sub"
             )
 
         children.append(
@@ -327,7 +220,7 @@ class ReolinkVODMediaSource(MediaSource):
                 identifier=f"RES|{config_entry_id}|{channel}|sub",
                 media_class=MediaClass.CHANNEL,
                 media_content_type=MediaType.PLAYLIST,
-                title=f"{'Standard' if hasExt else 'Low'} resolution",
+                title="Low resolution",
                 can_play=False,
                 can_expand=True,
             )
@@ -340,7 +233,7 @@ class ReolinkVODMediaSource(MediaSource):
                     identifier=f"RES|{config_entry_id}|{channel}|main",
                     media_class=MediaClass.CHANNEL,
                     media_content_type=MediaType.PLAYLIST,
-                    title="High resolution",
+                    title=f"High resolution{' (limited browser h265 support)' if main_enc == 'h265' else ''}",
                     can_play=False,
                     can_expand=True,
                 ),
